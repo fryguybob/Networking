@@ -167,9 +167,9 @@ listenThread tag chan sock = go
     go = do
       (m, addr) <- NB.recvFrom sock 140
       writeBChan chan $ MessageEvent 
-                      $ if tag 
+                      $ (if tag 
                           then T.pack (show addr) <> ": " 
-                          else ""
+                          else "")
                       <> E.decodeUtf8 m
       go
 
