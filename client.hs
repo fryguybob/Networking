@@ -123,7 +123,8 @@ handleEvent s e@(VtyEvent (EvKey key [MShift])) =
       KChar '\t' -> continue (s & focus %~ focusPrev)
       _          -> handleW s e
 handleEvent s e@(AppEvent (MessageEvent m)) = do
-    liftIO $ forM_ (s^.network.clients) $ \(c, addr) -> do
+    let cs = s^.network.clients
+    liftIO $ forM_ cs $ \(c, addr) -> do
         NB.sendTo c (E.encodeUtf8 m) addr
     continue $ s & messages %~ scroll . remove . add
   where
@@ -160,16 +161,20 @@ app = App
 
 -- -------------------------- Net code -----------------------
 
-listenThread :: BChan MessageEvent -> N.Socket -> IO ()
-listenThread chan sock = go 
+listenThread :: Bool -> BChan MessageEvent -> N.Socket -> IO ()
+listenThread tag chan sock = go 
   where
     go = do
       (m, addr) <- NB.recvFrom sock 140
-      writeBChan chan $ MessageEvent $ T.pack (show addr) <> ": " <> E.decodeUtf8 m
+      writeBChan chan $ MessageEvent 
+                      $ if tag 
+                          then T.pack (show addr) <> ": " 
+                          else ""
+                      <> E.decodeUtf8 m
       go
 
-startListen :: BChan MessageEvent -> String -> IO T.Text
-startListen chan port = do
+startListen :: Bool -> BChan MessageEvent -> String -> IO T.Text
+startListen server chan port = do
     let hints = N.defaultHints { N.addrFlags = [N.AI_PASSIVE]
                                , N.addrSocketType = N.Datagram
                                }
@@ -178,7 +183,7 @@ startListen chan port = do
     N.bind sock (N.addrAddress addr)
     desc <- T.pack . show <$> N.getSocketName sock
 
-    forkIO $ listenThread chan sock
+    forkIO $ listenThread server chan sock
     return desc
 
 startServer :: BChan MessageEvent -> String -> FilePath -> IO NetworkSettings
@@ -186,7 +191,7 @@ startServer chan port clients = do
     cs <- lines <$> readFile clients
     cs' <- mapM (flip getSendSock port) cs
 
-    desc <- startListen chan port
+    desc <- startListen True chan port
 
     return $ NetworkSettings cs' Nothing ("Hosting on " <> desc)
 
@@ -204,7 +209,7 @@ startClient chan server port = do
     c@(sock, addr) <- getSendSock server port
     let desc = T.pack . show $ addr
 
-    _ <- startListen chan port
+    _ <- startListen False chan port
 
     return $ NetworkSettings [] (Just c) ("Sending to " <> desc)
 
