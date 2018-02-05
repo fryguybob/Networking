@@ -5,6 +5,7 @@ import qualified Data.Text          as T
 import qualified Data.Text.Zipper   as Z
 import qualified Data.Text.Encoding as E
 import qualified Data.Vector        as V
+import qualified Data.Map           as M
 import Data.Monoid ((<>))
 import Data.Maybe (isJust)
 import Data.List (isPrefixOf)
@@ -40,6 +41,7 @@ data NetworkSettings
       { _clients     :: [(N.Socket, N.SockAddr)]
       , _server      :: Maybe (N.Socket, N.SockAddr)
       , _description :: T.Text
+      , _names       :: M.Map N.SockAddr T.Text
       }
 
 data State = State
@@ -50,7 +52,7 @@ data State = State
     , _network  :: !NetworkSettings
     }
 
-data MessageEvent = MessageEvent T.Text
+data MessageEvent = MessageEvent (Maybe N.SockAddr) T.Text
 
 makeLenses ''NetworkSettings
 makeLenses ''State
@@ -85,11 +87,12 @@ handleSendMessage s
         liftIO $ case s^.network.server of
             Just (sock, addr) -> void $ NB.sendTo sock (E.encodeUtf8 m) addr
             Nothing           -> forM_ (s^.network.clients) $ \(c, addr) -> do
-                                     NB.sendTo c (E.encodeUtf8 m) addr
+                                     NB.sendTo c t' addr
         continue $ s' & echo
   where s' = s & send %~ applyEdit Z.clearZipper
         m = mconcat $ getEditContents (s^.send)
         t = mconcat $ s^.hostName : ": " : [m]
+        t'= E.encodeUtf8 t
         l = s^.messages.listElementsL.to length
         add = listInsert l t
         remove = if l >= maxMessages
@@ -122,12 +125,18 @@ handleEvent s e@(VtyEvent (EvKey key [MShift])) =
     case key of
       KChar '\t' -> continue (s & focus %~ focusPrev)
       _          -> handleW s e
-handleEvent s e@(AppEvent (MessageEvent m)) = do
+handleEvent s e@(AppEvent (MessageEvent src m)) = do
     let cs = s^.network.clients
     liftIO $ forM_ cs $ \(c, addr) -> do
-        NB.sendTo c (E.encodeUtf8 m) addr
+        NB.sendTo c t' addr
     continue $ s & messages %~ scroll . remove . add
   where
+    t = case src of
+          Just a  -> case M.lookup a (s^.network.names) of
+                        Just n  -> n <> ": " <> m
+                        Nothing -> T.pack (show a) <> ": " <> m 
+          Nothing -> m
+    t'= E.encodeUtf8 t
     l = s^.messages.listElementsL.to length
     add = listInsert l m
     remove = if l >= maxMessages
@@ -166,11 +175,8 @@ listenThread tag chan sock = go
   where
     go = do
       (m, addr) <- NB.recvFrom sock 140
-      writeBChan chan $ MessageEvent 
-                      $ (if tag 
-                          then T.pack (show addr) <> ": " 
-                          else "")
-                      <> E.decodeUtf8 m
+      writeBChan chan $ MessageEvent (if tag then Just addr else Nothing)
+                                     (E.decodeUtf8 m)
       go
 
 startListen :: Bool -> BChan MessageEvent -> String -> IO T.Text
@@ -186,15 +192,6 @@ startListen server chan port = do
     forkIO $ listenThread server chan sock
     return desc
 
-startServer :: BChan MessageEvent -> String -> FilePath -> IO NetworkSettings
-startServer chan port clients = do
-    cs <- lines <$> readFile clients
-    cs' <- mapM (flip getSendSock port) cs
-
-    desc <- startListen True chan port
-
-    return $ NetworkSettings cs' Nothing ("Hosting on " <> desc)
-
 getSendSock :: String -> String -> IO (N.Socket, N.SockAddr)
 getSendSock host port = do
     let hints = N.defaultHints { N.addrFlags = [N.AI_ALL]
@@ -204,6 +201,16 @@ getSendSock host port = do
     sock <- N.socket (N.addrFamily addr) (N.addrSocketType addr) (N.addrProtocol addr)
     return (sock, N.addrAddress addr)
 
+startServer :: BChan MessageEvent -> String -> FilePath -> IO NetworkSettings
+startServer chan port clients = do
+    cs <- lines <$> readFile clients
+    cs' <- mapM (flip getSendSock port) cs
+    let m = M.fromList $ zip (map snd cs') (map T.pack cs)
+
+    desc <- startListen True chan port
+
+    return $ NetworkSettings cs' Nothing ("Hosting on " <> desc) m
+
 startClient :: BChan MessageEvent -> String -> String -> IO NetworkSettings
 startClient chan server port = do
     c@(sock, addr) <- getSendSock server port
@@ -211,7 +218,7 @@ startClient chan server port = do
 
     _ <- startListen False chan port
 
-    return $ NetworkSettings [] (Just c) ("Sending to " <> desc)
+    return $ NetworkSettings [] (Just c) ("Sending to " <> desc) M.empty
 
 main = do
     as <- getArgs
