@@ -31,6 +31,8 @@ import qualified Network.Socket.ByteString as NB
 
 import System.Exit
 import System.Environment
+import System.IO (hGetContents)
+import qualified System.Process as P
 
 data Name = Send
           | Messages
@@ -91,17 +93,24 @@ handleSend :: State -> BrickEvent n e -> EventM Name (Next State)
 handleSend s (VtyEvent e)
     = continue =<< handleEventLensed s send handleEditorEvent e
 
-handleSendMessage :: State -> EventM Name (Next State)
-handleSendMessage s
-    | T.isPrefixOf ":" m = runCommand m s'
-    | otherwise          = do
+handleKeyboardSend :: State -> EventM Name (Next State)
+handleKeyboardSend s
+   | T.isPrefixOf ":" m = runCommand m s'
+   | otherwise          = sendMessage m s' >>= continue
+  where
+    m = mconcat $ getEditContents (s^.send)
+    s' = s & send %~ applyEdit Z.clearZipper
+
+sendMessage :: T.Text -> State -> EventM Name State
+sendMessage m s
+    | T.null m = sendMessage " " s
+    | otherwise = do
         liftIO $ case s^.network.server of
             Just (sock, addr) -> void $ NB.sendTo sock (E.encodeUtf8 m) addr
             Nothing           -> forM_ (s^.network.clients) $ \(c, addr) -> do
                                      NB.sendTo c t' addr
-        continue $ s' & echo
-  where s' = s & send %~ applyEdit Z.clearZipper
-        m = mconcat $ getEditContents (s^.send)
+        return $ s & echo
+  where 
         t = mconcat $ s^.hostName : ": " : [m]
         t'= E.encodeUtf8 t
         l = s^.messages.listElementsL.to length
@@ -116,13 +125,28 @@ handleSendMessage s
                  then messages %~ scroll . remove . add
                  else id
 
-
 maxMessages = 1000
+
+getProcLines :: String -> IO [String]
+getProcLines cmd = do
+    (pIn, pOut, pErr, handle) <- P.runInteractiveCommand cmd
+    exitCode <- P.waitForProcess handle
+    output <- hGetContents pOut
+    return $ lines output
+
+forHandle :: [a] -> s -> (a -> s -> EventM n s) -> EventM n (Next s)
+forHandle [] s _ = continue s
+forHandle (a:as) s h = do
+    s' <- h a s
+    forHandle as s' h
 
 runCommand :: T.Text -> State -> EventM Name (Next State)
 runCommand cmd s
     | cmd == ":q"     = halt s
     | cmd == ":clear" = continue $ s & messages %~ listClear
+    | T.isPrefixOf ":! " cmd = do
+        ls <- (map T.pack . take 25) <$> (liftIO $ getProcLines (T.unpack . T.drop 3 $ cmd))
+        forHandle ls s sendMessage
     | otherwise       = continue s
 
 handleEvent :: State -> BrickEvent n MessageEvent -> EventM Name (Next State)
@@ -130,7 +154,7 @@ handleEvent s e@(VtyEvent (EvKey key [])) =
     case key of
       KEsc       -> halt s
       KChar '\t' -> continue (s & focus %~ focusNext)
-      KEnter     -> handleSendMessage s
+      KEnter     -> handleKeyboardSend s
       _          -> handleW s e
 handleEvent s e@(VtyEvent (EvKey key [MShift])) =
     case key of
