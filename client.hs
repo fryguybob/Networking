@@ -36,12 +36,23 @@ data Name = Send
           | Messages
     deriving (Ord, Eq, Enum, Bounded, Show)
 
+newtype NoPort = NoPort N.SockAddr
+
+instance Ord NoPort where
+  NoPort (N.SockAddrInet _ a)  `compare` NoPort (N.SockAddrInet _ b)  = a `compare` b     
+  NoPort (N.SockAddrInet6 _ _ a _) `compare`
+    NoPort (N.SockAddrInet6 _ _ b _) = a `compare` b   
+  NoPort a `compare` NoPort b = a `compare` b
+
+instance Eq NoPort where
+  a == b = a `compare` b == EQ
+
 data NetworkSettings
     = NetworkSettings
       { _clients     :: [(N.Socket, N.SockAddr)]
       , _server      :: Maybe (N.Socket, N.SockAddr)
       , _description :: T.Text
-      , _names       :: M.Map N.SockAddr T.Text
+      , _names       :: M.Map NoPort T.Text
       }
 
 data State = State
@@ -132,13 +143,13 @@ handleEvent s e@(AppEvent (MessageEvent src m)) = do
     continue $ s & messages %~ scroll . remove . add
   where
     t = case src of
-          Just a  -> case M.lookup a (s^.network.names) of
+          Just a  -> case M.lookup (NoPort a) (s^.network.names) of
                         Just n  -> n <> ": " <> m
                         Nothing -> T.pack (show a) <> ": " <> m 
           Nothing -> m
     t'= E.encodeUtf8 t
     l = s^.messages.listElementsL.to length
-    add = listInsert l m
+    add = listInsert l t
     remove = if l >= maxMessages
                then listRemove 0
                else id
@@ -205,7 +216,7 @@ startServer :: BChan MessageEvent -> String -> FilePath -> IO NetworkSettings
 startServer chan port clients = do
     cs <- lines <$> readFile clients
     cs' <- mapM (flip getSendSock port) cs
-    let m = M.fromList $ zip (map snd cs') (map T.pack cs)
+    let m = M.fromList $ zip (map (NoPort . snd) cs') (map T.pack cs)
 
     desc <- startListen True chan port
 
